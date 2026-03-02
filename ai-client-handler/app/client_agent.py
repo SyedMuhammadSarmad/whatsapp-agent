@@ -1,5 +1,5 @@
 from agents import Agent, Runner
-from agents.tools.asana_tool import get_project_status, create_client_task
+from app.tools.asana_tool import get_project_status, create_client_task
 from services.session_manager import get_history, save_history
 
 client_agent = Agent(

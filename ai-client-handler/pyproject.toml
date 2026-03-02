@@ -1,7 +1,7 @@
 [project]
 name = "whatsapp-ai-agent"
 version = "0.1.0"
-description = "WhatsApp AI agent with Asana integration (Twilio + OpenAI Agents SDK)"
+description = "WhatsApp AI agent — Meta Cloud API for text, Twilio for voice (Phase 3)"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.111.0",

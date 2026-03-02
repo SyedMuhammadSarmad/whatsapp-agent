@@ -2,297 +2,203 @@
 
 ## Overview
 
-A Python-based AI agent system that handles client communication via WhatsApp,
-integrates with Asana for project management, and is designed to scale from
-text-based automation to full voice conversations across messaging platforms.
+A Python-based AI agent that handles client communication via WhatsApp,
+integrates with Asana for project management, and scales from text-based
+automation to full voice conversations.
 
-**Project manager:** [uv](https://docs.astral.sh/uv/) — replaces pip + venv + pip-tools.
-
----
-
-## Vision
-
-```
-Client (WhatsApp / Phone Call)
-        ↓
-    Twilio (communication layer)
-        ↓
-    FastAPI Server (your backend)
-        ↓
-    OpenAI Agents SDK (intelligence layer)
-        ↓
-    Tools: Asana | Memory (Redis)
-        ↓
-    Response back to Client
-```
+**Current phase:** Phase 1 (text-only, Meta Cloud API)
+**Project manager:** [uv](https://docs.astral.sh/uv/)
 
 ---
 
-## Technology Stack
+## System Architecture
 
-### Core
-
-| Technology | Role | Why |
-|---|---|---|
-| **Python 3.11+** | Language | Full async support, rich ecosystem |
-| **uv** | Project manager | Replaces pip + venv + pip-tools in one binary |
-| **FastAPI** | Backend server | Fast, async, perfect for webhooks |
-| **OpenAI Agents SDK** | Agent logic | Tool calling, multi-agent, history management |
-| **gpt-4o-mini** | Language model | Cost-optimised (~$0.002/1K tokens) |
-
-### Communication
-
-| Technology | Role | Why |
-|---|---|---|
-| **Twilio WhatsApp Sandbox** | WhatsApp messaging | Free for testing, no approval needed |
-| **Twilio REST API** | Send replies | Async reply via REST (not TwiML) |
-
-### Integrations
-
-| Technology | Role | Why |
-|---|---|---|
-| **Asana Python SDK v5** | Project management tools | Agent can query/create tasks |
-| **Redis (asyncio)** | Conversation history / session state | Fast, ephemeral, 24h TTL |
-
-### Infrastructure
-
-| Technology | Role |
-|---|---|
-| **Docker** | Local Redis container |
-| **ngrok** | Expose localhost to Twilio during development |
-| **Railway / Render** | Production hosting (future) |
+```
+Client (WhatsApp)
+        │
+        ▼
+Meta Cloud API
+        │  POST JSON
+        ▼
+FastAPI  /webhook/whatsapp
+        │
+        ├─ GET  → webhook ownership verification (one-time)
+        └─ POST → validate X-Hub-Signature-256
+                  filter type="text" messages
+                  normalize → IncomingMessage
+                        │
+                        ▼
+              agents/client_agent.py
+                        │
+                  ┌─────┴─────┐
+                  │           │
+            Redis history   OpenAI gpt-4o-mini
+                  │           │
+                  │      ┌────┴────┐
+                  │    Asana     Asana
+                  │  get_status  create_task
+                  │
+                  └─ save updated history
+                        │
+                        ▼
+              meta_provider.send(reply)
+                        │
+                        ▼
+              Graph API → client's WhatsApp
+```
 
 ---
 
-## Architecture
+## Platform Design
 
-### Platform Migration Design
-
-The system is designed so switching WhatsApp providers (Twilio → Meta Cloud API)
-requires changing **only 2 files**, not the agent or business logic.
-
-| Layer | File | Platform-specific? |
-|---|---|---|
-| Agent logic | `agents/client_agent.py` | **No** — never changes |
-| Session memory | `services/session_manager.py` | **No** — never changes |
-| Asana tools | `agents/tools/asana_tool.py` | **No** — never changes |
-| Messaging contract | `services/messaging/base.py` | **No** — never changes |
-| Twilio implementation | `services/messaging/twilio_provider.py` | **Yes** → swap with `meta_provider.py` |
-| Webhook parser | `routers/whatsapp.py` | **Yes** → update to parse Meta JSON format |
-
-### Normalization boundary
-
-```python
-# services/messaging/base.py — the contract that never changes
-@dataclass
-class IncomingMessage:
-    sender_id: str       # E.164 phone number
-    text: str
-    media_url: Optional[str] = None  # Phase 2: voice notes
-
-class MessagingProvider(ABC):
-    @abstractmethod
-    async def send(self, to: str, text: str) -> None: ...
-```
-
-The webhook normalises the raw Twilio form POST into `IncomingMessage` immediately.
-Everything below that point is platform-agnostic.
-
-### Conversation history flow
+Two providers, two channels, zero overlap:
 
 ```
-Redis.get(client_id)          ← load prior turns
-    ↓
-append {"role": "user", ...}  ← add new message
-    ↓
-Runner.run(agent, input=history)
-    ↓
-result.to_input_list()        ← full turn incl. tool calls
-    ↓
-Redis.setex(client_id, 86400) ← persist with 24h TTL
-    ↓
-return result.final_output
+WhatsApp text  → Meta Cloud API  → /webhook/whatsapp  →  meta_provider.py
+Voice calls    → Twilio Voice    → /webhook/voice      →  twilio_voice.py (Phase 3)
+                                         │
+                              Both share the same:
+                              • client_agent.py
+                              • session_manager.py (Redis)
+                              • asana_tool.py
 ```
 
-`result.to_input_list()` is the key — it serialises the complete turn
-(user message + tool calls + tool results + assistant reply) in the format
-the SDK expects on the next `Runner.run()` call.
+Same client, unified history: phone number normalization in `IncomingMessage.session_key`
+means WhatsApp texts and voice calls use the same Redis key (`+15551234567`),
+so the agent always has full context regardless of channel.
 
 ---
 
-## Project Structure
+## Phone Number Strategy
+
+| Phase | Provider | Number |
+|---|---|---|
+| Dev (now) | Meta free test number | provided by Meta |
+| Phase 3 dev | Twilio test number | ~$1/month |
+| Production | One real business number | registered on Meta + Twilio |
+
+To use one number for both: buy a Twilio number → register it with WhatsApp Business.
+Alternatively use your own business number for Meta and a separate Twilio number for voice.
+
+---
+
+## File Map
 
 ```
 ai-client-handler/
-├── pyproject.toml             # uv project manifest (replaces requirements.txt)
-├── uv.lock                    # auto-generated lockfile (commit this)
-├── requirements.txt           # generated via: uv export --format requirements-txt
-├── main.py                    # FastAPI app entry point
-├── config.py                  # pydantic-settings env vars
-├── .env.example               # template — copy to .env
+├── main.py                           FastAPI app entry point
+├── config.py                         pydantic-settings env vars
+├── pyproject.toml                    uv project manifest
+├── .env.example                      credential template
 │
 ├── agents/
-│   ├── client_agent.py        # Agent + history management (platform-agnostic)
+│   ├── client_agent.py               Agent + Redis history (platform-agnostic)
 │   └── tools/
-│       └── asana_tool.py      # get_project_status, create_client_task
+│       └── asana_tool.py             get_project_status, create_client_task
 │
 ├── routers/
-│   └── whatsapp.py            # Twilio webhook — only platform-specific file
+│   └── whatsapp.py                   Meta webhook (GET verify + POST handler)
+│                                     ← Phase 3 adds: voice.py
 │
 └── services/
     ├── messaging/
-    │   ├── base.py            # IncomingMessage + abstract MessagingProvider
-    │   └── twilio_provider.py # Twilio implementation (swap to migrate)
-    └── session_manager.py     # Redis get/save/clear history
-```
-
-> Voice files (`voice.py`, `transcription.py`) are deferred to Phase 2+.
-
----
-
-## Implementation Phases
-
-### Phase 1 — WhatsApp Text (MVP) ✅
-
-**What it does:**
-- Receives WhatsApp messages via Twilio webhook
-- Validates Twilio signature (security)
-- Passes message + Redis conversation history to OpenAI agent
-- Agent queries Asana for project data
-- Sends reply back via Twilio REST API
-
-**Running locally:**
-```bash
-# Prerequisites: uv installed, Docker running
-
-cd ai-client-handler
-
-uv sync                              # install deps, create .venv/
-cp .env.example .env                 # fill in API keys
-
-docker run -d -p 6379:6379 redis     # start Redis
-
-uv run uvicorn main:app --reload     # start FastAPI on :8000
-ngrok http 8000                      # expose to internet
-
-# Set https://<ngrok-id>.ngrok-free.app/webhook/whatsapp
-# in Twilio sandbox console → "When a message comes in"
-```
-
-**Verification checklist:**
-- [ ] `curl http://localhost:8000/health` returns `{"status":"ok"}`
-- [ ] Send WhatsApp → agent replies within 3–5 seconds
-- [ ] Send second message → agent remembers previous context (Redis working)
-
----
-
-### Phase 2 — Audio Message Support (Deferred)
-
-**What it adds:**
-- Client sends voice note on WhatsApp
-- System downloads from Twilio, transcribes via Whisper
-- Transcribed text enters normal agent flow
-
-**Files to add:**
-```
-services/transcription.py     # Whisper transcription
-```
-
-**Cost:** ~$0.006/min of audio (Whisper API)
-
-**Key change in `routers/whatsapp.py`:**
-```python
-# Already supported via IncomingMessage.media_url
-msg = IncomingMessage(sender_id=From, text=Body, media_url=MediaUrl0)
-if msg.media_url:
-    msg.text = await transcribe_audio(msg.media_url)
+    │   ├── base.py                   IncomingMessage + phone normalization + abstract provider
+    │   ├── meta_provider.py          Meta Graph API (current, text)
+    │   └── twilio_provider.py        Twilio WhatsApp (kept for reference / Phase 3 voice)
+    │                                 ← Phase 3 adds: twilio_voice_provider.py
+    └── session_manager.py            Redis get/save/clear history
 ```
 
 ---
 
-### Phase 3 — Voice Call Support (Deferred)
+## Platform Migration Reference
 
-**What it adds:**
-- Client calls Twilio number
-- Call audio streams to FastAPI via WebSocket
-- OpenAI Realtime API handles real-time voice conversation
-- Agent can query Asana mid-call and speak results
-
-**Files to add:**
-```
-routers/voice.py     # TwiML webhook + WebSocket bridge
-```
-
-**Cost:** Twilio Voice (~$0.013/min) + OpenAI Realtime (~$0.06/min audio)
+| Layer | File | Platform-specific? |
+|---|---|---|
+| Agent logic | `agents/client_agent.py` | No — never changes |
+| Asana tools | `agents/tools/asana_tool.py` | No — never changes |
+| Session memory | `services/session_manager.py` | No — never changes |
+| Contract | `services/messaging/base.py` | No — never changes |
+| Text provider | `services/messaging/meta_provider.py` | Yes — swap per provider |
+| Webhook parser | `routers/whatsapp.py` | Yes — one per platform format |
 
 ---
 
-### Phase 4 — Meta Cloud API Migration (Deferred)
+## Key Design Decisions
 
-**What changes:**
-1. Write `services/messaging/meta_provider.py` implementing `MessagingProvider`
-2. Update `routers/whatsapp.py` to parse Meta's JSON webhook (not Twilio form data)
-3. Set `MESSAGING_PROVIDER=meta` in `.env`
-
-**What stays the same:** everything else — agent, tools, Redis, Asana.
+| Decision | Rationale |
+|---|---|
+| `result.to_input_list()` for Redis history | Preserves full turn (tool calls + results), not just text |
+| `@function_tool` decorator | Correct OpenAI Agents SDK decorator (not `@tool`) |
+| `IncomingMessage.session_key` normalization | E.164 key ensures cross-channel Redis history sharing |
+| HMAC-SHA256 with `hmac.compare_digest` | Prevents timing attacks on signature validation |
+| Return 200 for status update events | Meta retries and disables webhook on any non-200 response |
+| `httpx.AsyncClient` in MetaProvider | Non-blocking; compatible with FastAPI's async event loop |
+| `gpt-4o-mini` model | ~15× cheaper than gpt-4o, sufficient for text task management |
+| `package = false` in pyproject.toml | Marks this as an application, not an installable library |
 
 ---
 
 ## Environment Variables
 
 ```env
-# OpenAI
+# Core
 OPENAI_API_KEY=sk-...
-
-# Twilio (WhatsApp Sandbox)
-TWILIO_ACCOUNT_SID=AC...
-TWILIO_AUTH_TOKEN=...
-TWILIO_WHATSAPP_NUMBER=whatsapp:+14155238886
-
-# Asana
 ASANA_ACCESS_TOKEN=...
 ASANA_WORKSPACE_ID=...
-
-# Redis
 REDIS_URL=redis://localhost:6379
+
+# Meta Cloud API (Phase 1 — required)
+META_PHONE_NUMBER_ID=...
+META_ACCESS_TOKEN=...
+META_APP_SECRET=...
+META_VERIFY_TOKEN=...
+
+# Twilio Voice (Phase 3 — leave empty until then)
+TWILIO_ACCOUNT_SID=
+TWILIO_AUTH_TOKEN=
+TWILIO_PHONE_NUMBER=
 ```
 
 ---
 
-## Key Design Decisions & Bug Fixes
+## Phases
 
-| Decision | Rationale |
-|---|---|
-| `result.to_input_list()` for history | Preserves full turn (tool calls + results), not just text |
-| `@function_tool` decorator | Correct OpenAI Agents SDK decorator (not `@tool`) |
-| Twilio `RequestValidator` in webhook | Prevents forged requests — returns 403 on failure |
-| `redis.asyncio` (non-blocking) | All handlers are async — blocking Redis would freeze the event loop |
-| `IncomingMessage` dataclass boundary | Decouples agent from platform — enables migration with 2 file changes |
-| Asana SDK v5 (`TasksApi`, `ProjectsApi`) | Old flat `asana.Client` API is deprecated |
-| `gpt-4o-mini` as default model | ~15× cheaper than gpt-4o, sufficient for text task management |
-| `package = false` in pyproject.toml | Marks this as an app, not a library — uv won't try to build/install it |
+### Phase 1 — WhatsApp Text (current) ✅
+Meta Cloud API. See `SETUP.md` for full instructions.
+
+### Phase 2 — Audio Messages (voice notes)
+See `docs/phase-2-audio.md`
+
+### Phase 3 — Voice Calls
+See `docs/phase-3-voice-calls.md`
+
+### Phase 4 — Production
+See `docs/phase-4-production.md`
 
 ---
 
-## Cost Estimates (MVP text-only)
+## Running Locally
 
-| Service | Free | Paid |
+```bash
+cd ai-client-handler
+uv sync
+cp .env.example .env        # fill in META_* and other keys
+docker run -d -p 6379:6379 redis
+uv run uvicorn main:app --reload --port 8000
+ngrok http 8000
+# Paste ngrok URL into Meta console → WhatsApp → Configuration
+```
+
+---
+
+## Cost Estimates (Phase 1, text-only)
+
+| Service | Free tier | Paid |
 |---|---|---|
+| Meta WhatsApp | 1,000 conversations/month free | $0.005–0.09 per conversation |
 | OpenAI gpt-4o-mini | Pay per use | ~$0.002/1K tokens |
-| Twilio WhatsApp Sandbox | Free for testing | ~$0.005/message in production |
 | Asana | Free (≤15 users) | — |
 | Redis (Upstash) | 10K req/day free | $0.2/100K req |
-| Hosting (Railway) | — | ~$5/month |
 
-**Estimated cost per WhatsApp conversation (10 turns):** < $0.05
-
----
-
-## Resources
-
-- [uv Documentation](https://docs.astral.sh/uv/)
-- [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/)
-- [Twilio WhatsApp Sandbox](https://www.twilio.com/docs/whatsapp/sandbox)
-- [Asana Python SDK v5](https://github.com/Asana/python-asana)
-- [Redis asyncio](https://redis-py.readthedocs.io/en/stable/examples/asyncio_examples.html)
-- [FastAPI](https://fastapi.tiangolo.com/)
+**Estimated cost per 10-turn conversation:** < $0.05

@@ -1,6 +1,20 @@
-# Setup Guide — WhatsApp AI Agent (uv)
+# Setup Guide — WhatsApp AI Agent
 
-> **Prerequisite accounts:** Twilio (free sandbox), OpenAI API, Asana (free), Redis (local Docker or Upstash free tier)
+> **Current phase:** Phase 1 — WhatsApp text messaging via Meta Cloud API
+> For future phases see `docs/phase-2-audio.md`, `docs/phase-3-voice-calls.md`, `docs/phase-4-production.md`
+
+---
+
+## Prerequisites
+
+| Account | Free tier | Sign up |
+|---|---|---|
+| Meta for Developers | Free sandbox, 1000 convos/month | developers.facebook.com |
+| OpenAI API | Pay per use (~$0.002/1K tokens) | platform.openai.com |
+| Asana | Free (≤15 users) | app.asana.com |
+| Redis | Local Docker or Upstash free (10K req/day) | upstash.com |
+
+You do **not** need a Twilio account for Phase 1.
 
 ---
 
@@ -17,33 +31,40 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 uv --version
 ```
 
-> uv replaces pip, venv, and pip-tools in one binary. No other Python tooling needed.
-
 ---
 
-## 2. Clone / enter the project
+## 2. Install project dependencies
 
 ```bash
 cd ai-client-handler
-```
-
----
-
-## 3. Create the virtual environment and install dependencies
-
-```bash
-# Reads pyproject.toml, resolves deps, creates .venv/, writes uv.lock
 uv sync
 ```
 
-To also install dev dependencies (pytest, ruff):
+uv reads `pyproject.toml`, resolves everything, and creates `.venv/` automatically.
+You never need to manually activate the venv — `uv run` handles that.
 
-```bash
-uv sync --group dev
-```
+---
 
-uv automatically creates `.venv/` inside `ai-client-handler/`. You never need to
-manually activate it — `uv run` handles that for you.
+## 3. Get Meta Cloud API credentials
+
+### Step-by-step
+
+1. Go to [developers.facebook.com](https://developers.facebook.com) and log in with your Facebook / Meta account
+2. Click **My Apps → Create App**
+3. Select **Business** as the app type → give it a name → Create
+4. On the app dashboard, find **WhatsApp** and click **Set up**
+5. Under **WhatsApp → Getting Started** you will see:
+   - **Temporary access token** — copy this as `META_ACCESS_TOKEN`
+   - **Phone Number ID** — copy this as `META_PHONE_NUMBER_ID`
+   - **Test phone number** — this is what clients will message during dev
+6. Go to **App Settings → Basic** → copy **App Secret** as `META_APP_SECRET`
+7. Under **WhatsApp → Configuration** you will configure the webhook URL later (Step 7)
+8. Add your personal WhatsApp number as a **test recipient**:
+   - Under **WhatsApp → Getting Started → To** field, add your number
+   - Meta allows up to 5 test recipients for free
+
+> **Permanent token for production:** The temporary token expires in 24 hours.
+> To get a permanent one: Business Settings → System Users → Create → assign WhatsApp permissions → Generate token.
 
 ---
 
@@ -53,17 +74,20 @@ manually activate it — `uv run` handles that for you.
 cp .env.example .env
 ```
 
-Open `.env` and fill in your real credentials:
+Open `.env` and fill in:
 
-| Variable | Where to get it |
+| Variable | Where to find it |
 |---|---|
 | `OPENAI_API_KEY` | platform.openai.com → API keys |
-| `TWILIO_ACCOUNT_SID` | twilio.com → Console dashboard |
-| `TWILIO_AUTH_TOKEN` | twilio.com → Console dashboard |
-| `TWILIO_WHATSAPP_NUMBER` | `whatsapp:+14155238886` (sandbox default) |
-| `ASANA_ACCESS_TOKEN` | app.asana.com → Profile → My Profile Settings → Apps |
-| `ASANA_WORKSPACE_ID` | Asana URL: `app.asana.com/0/<workspace_id>/...` |
+| `META_PHONE_NUMBER_ID` | WhatsApp → Getting Started → Phone Number ID |
+| `META_ACCESS_TOKEN` | WhatsApp → Getting Started → Temporary access token |
+| `META_APP_SECRET` | App Settings → Basic → App Secret |
+| `META_VERIFY_TOKEN` | **You choose this** — any string (e.g. `my-secret-42`). You'll paste the same value in the Meta console in Step 7. |
+| `ASANA_ACCESS_TOKEN` | app.asana.com → Profile → Apps → Personal access token |
+| `ASANA_WORKSPACE_ID` | From your Asana URL: `app.asana.com/0/<workspace_id>/...` |
 | `REDIS_URL` | `redis://localhost:6379` (local) or Upstash URL |
+
+Leave `TWILIO_*` variables empty — they're only needed in Phase 3.
 
 ---
 
@@ -75,63 +99,87 @@ Open `.env` and fill in your real credentials:
 docker run -d --name redis-agent -p 6379:6379 redis:7-alpine
 ```
 
-### Option B — Upstash (free cloud, no Docker needed)
+### Option B — Upstash (no Docker, free cloud tier)
 
-1. Sign up at upstash.com → Create a Redis database
-2. Copy the `UPSTASH_REDIS_REST_URL` → use as `REDIS_URL` in `.env`
-   Format: `rediss://:password@host:port`
+1. Sign up at [upstash.com](https://upstash.com) → Create a Redis database → copy the URL
+2. Set `REDIS_URL=rediss://:password@host:port` in `.env`
 
 ---
 
 ## 6. Run the development server
 
 ```bash
-# From inside ai-client-handler/
+cd ai-client-handler
 uv run uvicorn main:app --reload --port 8000
 ```
 
-You should see:
+Verify it started:
+```bash
+curl http://localhost:8000/health
+# → {"status":"ok"}
 ```
-INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
-INFO:     Started reloader process
-```
-
-Verify with: `curl http://localhost:8000/health` → `{"status":"ok"}`
 
 ---
 
-## 7. Expose to the internet (Twilio needs a public URL)
+## 7. Expose your server to the internet
+
+Meta needs to reach your local machine to deliver webhook events.
 
 ```bash
 ngrok http 8000
 ```
 
-ngrok gives you a URL like `https://abc123.ngrok-free.app`.
+ngrok gives you a URL like `https://abc123.ngrok-free.app`. Keep this terminal open.
 
 ---
 
-## 8. Configure Twilio WhatsApp Sandbox
+## 8. Register the webhook in Meta console
 
-1. Go to [twilio.com/console](https://twilio.com/console)
-2. Navigate to **Messaging → Try it out → Send a WhatsApp message**
-3. Follow the sandbox join instructions (send a WhatsApp message to the sandbox number)
-4. Under **Sandbox settings**, set:
-   - **When a message comes in:** `https://abc123.ngrok-free.app/webhook/whatsapp`
-   - Method: `HTTP POST`
-5. Save
+1. Go to your app → **WhatsApp → Configuration**
+2. Click **Edit** next to Webhook
+3. Set:
+   - **Callback URL:** `https://abc123.ngrok-free.app/webhook/whatsapp`
+   - **Verify token:** the value you set as `META_VERIFY_TOKEN` in `.env`
+4. Click **Verify and save** — Meta will call `GET /webhook/whatsapp` to verify ownership
+5. Under **Webhook fields**, click **Manage** and subscribe to: `messages`
+
+You should see **"Webhook verified"** in the console.
 
 ---
 
 ## 9. Test end-to-end
 
-Send a WhatsApp message to the Twilio sandbox number from your phone.
+Send a WhatsApp message to your Meta test phone number from one of your registered test recipient numbers.
 
 Expected flow:
-1. Twilio → POST to your `/webhook/whatsapp`
-2. FastAPI validates the Twilio signature
-3. `handle_message()` runs the agent with conversation history
-4. Agent optionally calls Asana tools
-5. Reply sent back to your WhatsApp within 3–5 seconds
+1. Meta → POST to your `/webhook/whatsapp`
+2. FastAPI validates `X-Hub-Signature-256`
+3. Agent runs with your conversation history from Redis
+4. Agent optionally queries Asana
+5. Reply arrives on your WhatsApp within 3–5 seconds
+
+Send a second message — the agent should remember your first message (Redis history working).
+
+---
+
+## Verification checklist
+
+```bash
+# 1. Webhook verification (simulates Meta's one-time check)
+curl "http://localhost:8000/webhook/whatsapp?hub.mode=subscribe&hub.verify_token=my-secret-42&hub.challenge=testtoken"
+# → testtoken
+
+# 2. Check Meta console shows "Webhook verified"
+
+# 3. Send WhatsApp message from your phone to the test number
+#    → agent replies within 3–5 seconds
+
+# 4. Send a follow-up message
+#    → agent references the first message (conversation memory working)
+
+# 5. Send a non-text message (e.g. a photo)
+#    → agent does NOT reply (gracefully ignored until Phase 2)
+```
 
 ---
 
@@ -140,26 +188,30 @@ Expected flow:
 | Task | Command |
 |---|---|
 | Install / sync dependencies | `uv sync` |
+| Run dev server | `uv run uvicorn main:app --reload --port 8000` |
 | Add a new package | `uv add <package>` |
 | Add a dev-only package | `uv add --group dev <package>` |
-| Remove a package | `uv remove <package>` |
-| Run a command in venv | `uv run <command>` |
 | Run tests | `uv run pytest` |
-| Lint | `uv run ruff check .` |
-| Export to requirements.txt | `uv export --format requirements-txt -o requirements.txt` |
-| Update all packages | `uv lock --upgrade` then `uv sync` |
-| Show installed packages | `uv pip list` |
+| Update all packages | `uv lock --upgrade && uv sync` |
 
 ---
 
 ## Troubleshooting
 
-**`ModuleNotFoundError`** — run `uv sync` to ensure the venv is up to date.
+**Webhook verification fails (403)**
+→ `META_VERIFY_TOKEN` in `.env` doesn't match what you typed in Meta console. They must be identical.
 
-**`403 Invalid Twilio signature`** — your ngrok URL changed. Update it in the Twilio console.
-Also ensure `request.url` in the webhook matches the URL Twilio is posting to exactly
-(watch for `http` vs `https`).
+**Signature validation fails (403) on incoming messages**
+→ `META_APP_SECRET` is wrong. Get it from App Settings → Basic → App Secret (not the access token).
 
-**`redis.exceptions.ConnectionError`** — Redis is not running. Start Docker container or check Upstash URL.
+**Agent doesn't reply**
+→ Check your `META_ACCESS_TOKEN` is valid (dev token expires in 24h). Check `OPENAI_API_KEY`. Check Redis is running.
 
-**`openai_agents` not found** — the package is `openai-agents` on PyPI. Run `uv add openai-agents`.
+**`redis.exceptions.ConnectionError`**
+→ Redis is not running. Start the Docker container or check your Upstash URL.
+
+**`ValidationError` on startup**
+→ A required env var is missing in `.env`. pydantic-settings will tell you which one.
+
+**ngrok URL changed**
+→ Update the Callback URL in Meta console → WhatsApp → Configuration.

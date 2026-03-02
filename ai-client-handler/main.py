@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()  # load .env into os.environ before any SDK reads environment variables
+
 from fastapi import FastAPI
 from routers.whatsapp import router as whatsapp_router
 
